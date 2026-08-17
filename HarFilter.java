@@ -264,8 +264,9 @@ public class HarFilter extends JFrame {
         final String type;
         final String status;
         final String url;
-        EntryInfo(Map<String, Object> raw, String method, String type, String status, String url) {
-            this.raw = raw; this.method = method; this.type = type; this.status = status; this.url = url;
+        final String host;
+        EntryInfo(Map<String, Object> raw, String method, String type, String status, String url, String host) {
+            this.raw = raw; this.method = method; this.type = type; this.status = status; this.url = url; this.host = host;
         }
     }
 
@@ -343,6 +344,40 @@ public class HarFilter extends JFrame {
         return "";
     }
 
+    /** Extract the host/domain from a URL without throwing on odd inputs. */
+    static String host(String url) {
+        if (url == null || url.isEmpty()) return "(none)";
+        String u = url;
+        int start;
+        int scheme = u.indexOf("://");
+        if (scheme >= 0) {
+            start = scheme + 3;
+        } else if (u.startsWith("//")) {   // scheme-relative
+            start = 2;
+        } else {                            // no authority: data:, blob:, about:, javascript:
+            int colon = u.indexOf(':');
+            if (colon > 0) return "(" + u.substring(0, colon).toLowerCase() + ")";
+            return "(none)";
+        }
+        int end = u.length();
+        for (int i = start; i < u.length(); i++) {
+            char c = u.charAt(i);
+            if (c == '/' || c == '?' || c == '#') { end = i; break; }
+        }
+        String authority = u.substring(start, end);
+        int at = authority.indexOf('@');            // strip userinfo
+        if (at >= 0) authority = authority.substring(at + 1);
+        if (authority.startsWith("[")) {            // IPv6 literal [::1]:8080 -> [::1]
+            int close = authority.indexOf(']');
+            if (close >= 0) authority = authority.substring(0, close + 1);
+        } else {
+            int colon = authority.indexOf(':');     // strip :port
+            if (colon >= 0) authority = authority.substring(0, colon);
+        }
+        authority = authority.toLowerCase();
+        return authority.isEmpty() ? "(none)" : authority;
+    }
+
     @SuppressWarnings("unchecked")
     static String respStatus(Map<String, Object> entry) {
         Object resp = entry.get("response");
@@ -359,7 +394,8 @@ public class HarFilter extends JFrame {
         for (Object o : entries) {
             if (!(o instanceof Map)) continue;
             Map<String, Object> e = (Map<String, Object>) o;
-            out.add(new EntryInfo(e, reqMethod(e), classifyType(e), respStatus(e), reqUrl(e)));
+            String url = reqUrl(e);
+            out.add(new EntryInfo(e, reqMethod(e), classifyType(e), respStatus(e), url, host(url)));
         }
         return out;
     }
@@ -376,6 +412,7 @@ public class HarFilter extends JFrame {
     private final JLabel countLabel = new JLabel(" ");
     private final CheckTableModel typeModel = new CheckTableModel("Type");
     private final CheckTableModel methodModel = new CheckTableModel("Method");
+    private final CheckTableModel domainModel = new CheckTableModel("Domain");
     private final PreviewModel previewModel = new PreviewModel();
     private final JButton saveButton = new JButton("Save Filtered HAR...");
 
@@ -401,10 +438,13 @@ public class HarFilter extends JFrame {
         top.add(fileLabel, BorderLayout.CENTER);
         content.add(top, BorderLayout.NORTH);
 
-        // --- filters: two check-tables side by side ---
+        // --- filters: type + method stacked on the left, domains on the right ---
+        JPanel leftFilters = new JPanel(new GridLayout(2, 1, 0, 10));
+        leftFilters.add(buildCheckPanel("Request / Resource types", typeModel));
+        leftFilters.add(buildCheckPanel("HTTP methods", methodModel));
         JPanel filters = new JPanel(new GridLayout(1, 2, 10, 0));
-        filters.add(buildCheckPanel("Request / Resource types", typeModel));
-        filters.add(buildCheckPanel("HTTP methods", methodModel));
+        filters.add(leftFilters);
+        filters.add(buildCheckPanel("Domains / hosts", domainModel));
 
         // --- preview table ---
         JTable preview = new JTable(previewModel);
@@ -434,6 +474,7 @@ public class HarFilter extends JFrame {
         // Recompute preview whenever a checkbox flips.
         typeModel.addTableModelListener(e -> refreshPreview());
         methodModel.addTableModelListener(e -> refreshPreview());
+        domainModel.addTableModelListener(e -> refreshPreview());
     }
 
     private JPanel buildCheckPanel(String title, CheckTableModel model) {
@@ -489,12 +530,15 @@ public class HarFilter extends JFrame {
         // count per type and per method
         TreeMap<String, Integer> typeCounts = new TreeMap<String, Integer>();
         TreeMap<String, Integer> methodCounts = new TreeMap<String, Integer>();
+        TreeMap<String, Integer> domainCounts = new TreeMap<String, Integer>();
         for (EntryInfo info : allInfos) {
             inc(typeCounts, info.type.isEmpty() ? "(unknown)" : info.type);
             inc(methodCounts, info.method.isEmpty() ? "(none)" : info.method);
+            inc(domainCounts, info.host.isEmpty() ? "(none)" : info.host);
         }
         typeModel.load(typeCounts);
         methodModel.load(methodCounts);
+        domainModel.load(domainCounts);
     }
 
     private static void inc(Map<String, Integer> m, String k) {
@@ -505,11 +549,13 @@ public class HarFilter extends JFrame {
     private List<EntryInfo> currentSelection() {
         Set<String> types = typeModel.selectedKeys();
         Set<String> methods = methodModel.selectedKeys();
+        Set<String> domains = domainModel.selectedKeys();
         List<EntryInfo> kept = new ArrayList<EntryInfo>();
         for (EntryInfo info : allInfos) {
             String t = info.type.isEmpty() ? "(unknown)" : info.type;
             String m = info.method.isEmpty() ? "(none)" : info.method;
-            if (types.contains(t) && methods.contains(m)) kept.add(info);
+            String d = info.host.isEmpty() ? "(none)" : info.host;
+            if (types.contains(t) && methods.contains(m) && domains.contains(d)) kept.add(info);
         }
         return kept;
     }
@@ -638,9 +684,11 @@ public class HarFilter extends JFrame {
             List<EntryInfo> infos = buildInfos(getEntries(root));
             TreeMap<String, Integer> types = new TreeMap<String, Integer>();
             TreeMap<String, Integer> methods = new TreeMap<String, Integer>();
+            TreeMap<String, Integer> domains = new TreeMap<String, Integer>();
             for (EntryInfo i : infos) {
                 inc(types, i.type.isEmpty() ? "(unknown)" : i.type);
                 inc(methods, i.method.isEmpty() ? "(none)" : i.method);
+                inc(domains, i.host.isEmpty() ? "(none)" : i.host);
             }
             System.out.println("Total requests: " + infos.size());
             System.out.println("\nResource types:");
@@ -649,14 +697,18 @@ public class HarFilter extends JFrame {
             System.out.println("\nHTTP methods:");
             for (Map.Entry<String, Integer> e : methods.entrySet())
                 System.out.printf("  %-14s %d%n", e.getKey(), e.getValue());
+            System.out.println("\nDomains:");
+            for (Map.Entry<String, Integer> e : domains.entrySet())
+                System.out.printf("  %-32s %d%n", e.getKey(), e.getValue());
             return;
         }
         if ("--filter".equals(cmd) && args.length >= 3) {
             String in = args[1], out = args[2];
-            Set<String> types = null, methods = null;
+            Set<String> types = null, methods = null, domains = null;
             for (int i = 3; i < args.length - 1; i++) {
                 if ("--types".equals(args[i]))   types   = csv(args[i + 1]);
                 if ("--methods".equals(args[i])) methods = csv(args[i + 1]);
+                if ("--domains".equals(args[i])) domains = csv(args[i + 1]);
             }
             Object root = new JsonParser(read(in)).parse();
             Map<String, Object> log = getLog(root);
@@ -667,7 +719,10 @@ public class HarFilter extends JFrame {
                 @SuppressWarnings("unchecked") Map<String, Object> e = (Map<String, Object>) o;
                 String t = classifyType(e); if (t.isEmpty()) t = "(unknown)";
                 String m = reqMethod(e);    if (m.isEmpty()) m = "(none)";
-                boolean keep = (types == null || types.contains(t)) && (methods == null || methods.contains(m));
+                String d = host(reqUrl(e)); if (d.isEmpty()) d = "(none)";
+                boolean keep = (types == null || types.contains(t))
+                        && (methods == null || methods.contains(m))
+                        && (domains == null || domains.contains(d));
                 if (keep) filtered.add(e);
             }
             log.put("entries", filtered);
@@ -678,8 +733,8 @@ public class HarFilter extends JFrame {
         System.out.println("HAR Request Filter - NestWorks\n"
                 + "Usage:\n"
                 + "  (no args)                              launch the desktop app\n"
-                + "  --list  input.har                      show request types & methods with counts\n"
-                + "  --filter input.har output.har [--types a,b] [--methods GET,POST]\n"
+                + "  --list  input.har                      show types, methods & domains with counts\n"
+                + "  --filter input.har output.har [--types a,b] [--methods GET,POST] [--domains a.com,b.com]\n"
                 + "                                         write a HAR keeping only matching requests");
     }
 
